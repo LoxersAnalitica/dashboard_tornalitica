@@ -6,6 +6,9 @@ import {
   getPipelines,
   getLeadCustomFields,
   getLeads,
+  getLeadsActuales,
+  getCambiosDeEtapa,
+  estadoDeCambio,
   buildStageIndex,
   nombreEtapa,
   diaDe,
@@ -65,11 +68,11 @@ function construirServidor() {
     },
     async ({ desde, hasta, pipeline_id }) => {
       try {
-        const { porStatus } = await buildStageIndex();
+        const indice = await buildStageIndex();
         const { leads, truncado } = await getLeads({ desde, hasta, pipeline_id });
         const acc = new Map();
         for (const lead of leads) {
-          const info = nombreEtapa(porStatus, lead);
+          const info = nombreEtapa(indice, lead);
           const clave = `${info.pipeline_id}|${lead.status_id}`;
           const fila = acc.get(clave) || {
             pipeline: info.pipeline,
@@ -108,11 +111,11 @@ function construirServidor() {
     },
     async ({ desde, hasta, pipeline_id }) => {
       try {
-        const { porStatus } = await buildStageIndex();
+        const indice = await buildStageIndex();
         const { leads, truncado } = await getLeads({ desde, hasta, pipeline_id });
         const acc = new Map();
         for (const lead of leads) {
-          const info = nombreEtapa(porStatus, lead);
+          const info = nombreEtapa(indice, lead);
           const dia = diaDe(lead.created_at);
           const clave = `${dia}|${info.pipeline_id}`;
           const fila = acc.get(clave) || {
@@ -128,6 +131,98 @@ function construirServidor() {
           (a, b) => (a.dia < b.dia ? -1 : a.dia > b.dia ? 1 : a.pipeline.localeCompare(b.pipeline))
         );
         return ok({ desde, hasta, total_leads: leads.length, truncado, filas });
+      } catch (e) {
+        return fallo(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    'kommo_pipeline_actual',
+    {
+      title: 'Foto actual del tablero',
+      description:
+        'Reparto de TODOS los leads por pipeline y etapa ahora mismo, sin filtrar por fecha. Es lo que se ve en el tablero de Kommo, incluidas las captaciones que llevan meses abiertas. Úsalo para "cómo está el embudo hoy"; para "qué ha pasado este mes" usa kommo_movimientos.',
+      inputSchema: {
+        pipeline_id: z.number().optional().describe('Limitar a un pipeline concreto'),
+        incluir_cerrados: z.boolean().optional().describe('Incluir ganados y perdidos (por defecto sí)'),
+      },
+    },
+    async ({ pipeline_id, incluir_cerrados }) => {
+      try {
+        const indice = await buildStageIndex();
+        const { leads, truncado } = await getLeadsActuales({
+          pipeline_id,
+          incluir_cerrados: incluir_cerrados !== false,
+        });
+        const acc = new Map();
+        for (const lead of leads) {
+          const info = nombreEtapa(indice, lead);
+          const clave = `${lead.pipeline_id}|${lead.status_id}`;
+          const fila = acc.get(clave) || {
+            pipeline: info.pipeline, pipeline_id: lead.pipeline_id,
+            etapa: info.etapa, status_id: lead.status_id, orden: info.orden,
+            leads: 0, importe: 0,
+          };
+          fila.leads += 1;
+          fila.importe += Number(lead.price || 0);
+          acc.set(clave, fila);
+        }
+        const filas = [...acc.values()].sort(
+          (a, b) => a.pipeline.localeCompare(b.pipeline) || a.orden - b.orden
+        );
+        return ok({ foto: 'ahora', total_leads: leads.length, truncado, filas });
+      } catch (e) {
+        return fallo(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    'kommo_movimientos',
+    {
+      title: 'Cambios de etapa del periodo',
+      description:
+        'Cuenta las ENTRADAS a cada etapa ocurridas dentro del rango de fechas, leyendo los eventos de cambio de etapa. Es la forma correcta de medir cuántas captaciones, visitas o ventas se han producido en el periodo, porque un lead que entró hace meses y avanza hoy cuenta hoy. Para el estado actual usa kommo_pipeline_actual; para la cohorte de leads nuevos, kommo_funnel.',
+      inputSchema: {
+        desde: z.string().describe('Fecha inicial YYYY-MM-DD del cambio de etapa'),
+        hasta: z.string().describe('Fecha final YYYY-MM-DD, incluida'),
+        pipeline_id: z.number().optional().describe('Limitar a un pipeline concreto'),
+      },
+    },
+    async ({ desde, hasta, pipeline_id }) => {
+      try {
+        const indice = await buildStageIndex();
+        const { eventos, truncado } = await getCambiosDeEtapa({ desde, hasta });
+        const acc = new Map();
+        let sinLeer = 0;
+        let muestra = null;
+        for (const ev of eventos) {
+          const destino = estadoDeCambio(ev.value_after);
+          if (!destino) {
+            sinLeer += 1;
+            if (!muestra) muestra = JSON.stringify(ev.value_after).slice(0, 300);
+            continue;
+          }
+          if (pipeline_id && destino.pipeline_id !== pipeline_id) continue;
+          const info = nombreEtapa(indice, { pipeline_id: destino.pipeline_id, status_id: destino.status_id });
+          const clave = `${destino.pipeline_id}|${destino.status_id}`;
+          const fila = acc.get(clave) || {
+            pipeline: info.pipeline, pipeline_id: destino.pipeline_id,
+            etapa: info.etapa, status_id: destino.status_id, orden: info.orden, entradas: 0,
+          };
+          fila.entradas += 1;
+          acc.set(clave, fila);
+        }
+        const filas = [...acc.values()].sort(
+          (a, b) => a.pipeline.localeCompare(b.pipeline) || a.orden - b.orden
+        );
+        const salida = { desde, hasta, total_eventos: eventos.length, truncado, filas };
+        if (sinLeer) {
+          salida.eventos_no_interpretados = sinLeer;
+          salida.muestra_value_after = muestra;
+        }
+        return ok(salida);
       } catch (e) {
         return fallo(e);
       }

@@ -97,24 +97,123 @@ export async function getLeads({ desde, hasta, pipeline_id } = {}) {
   return { leads, truncado };
 }
 
-/** Diccionario status_id -> {pipeline, etapa}. 142 y 143 son globales en Kommo. */
+/**
+ * Lee TODOS los leads de un pipeline sin filtrar por fecha: la foto actual del tablero.
+ * Es lo que se ve en Kommo, incluidas las captaciones que llevan meses abiertas.
+ */
+export async function getLeadsActuales({ pipeline_id, incluir_cerrados = true } = {}) {
+  const params = { limit: 250, page: 1 };
+  if (pipeline_id) params['filter[pipeline_id]'] = pipeline_id;
+  const leads = [];
+  let truncado = false;
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    params.page = page;
+    const json = await kommoGet('/api/v4/leads', params);
+    const lote = json?._embedded?.leads ?? [];
+    leads.push(...lote);
+    if (!json?._links?.next || lote.length === 0) break;
+    if (page === MAX_PAGES) truncado = true;
+    await sleep(170);
+  }
+  const filtrados = incluir_cerrados
+    ? leads
+    : leads.filter((l) => l.status_id !== 142 && l.status_id !== 143);
+  return { leads: filtrados, truncado };
+}
+
+/**
+ * Eventos de cambio de etapa ocurridos en un rango de fechas.
+ * Es la única forma de saber cuántas captaciones o visitas se han producido EN el periodo,
+ * independientemente de cuándo entró el lead: un lead de hace meses que se capta hoy
+ * cuenta hoy, y con el filtro por fecha de creación no aparecería nunca.
+ */
+export async function getCambiosDeEtapa({ desde, hasta } = {}) {
+  const offsetH = Number(process.env.KOMMO_TZ_OFFSET || 0);
+  const toUnix = (d, fin) => {
+    if (!d) return undefined;
+    return Math.floor(Date.parse(`${d}T${fin ? '23:59:59' : '00:00:00'}Z`) / 1000) - offsetH * 3600;
+  };
+  const params = { limit: 250, page: 1, 'filter[type]': 'lead_status_changed', 'filter[entity]': 'lead' };
+  const from = toUnix(desde, false);
+  const to = toUnix(hasta, true);
+  if (from !== undefined) params['filter[created_at][from]'] = from;
+  if (to !== undefined) params['filter[created_at][to]'] = to;
+
+  const eventos = [];
+  let truncado = false;
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    params.page = page;
+    const json = await kommoGet('/api/v4/events', params);
+    const lote = json?._embedded?.events ?? [];
+    eventos.push(...lote);
+    if (!json?._links?.next || lote.length === 0) break;
+    if (page === MAX_PAGES) truncado = true;
+    await sleep(170);
+  }
+  return { eventos, truncado };
+}
+
+/**
+ * Saca {status_id, pipeline_id} de un value_before / value_after de lead_status_changed.
+ * Kommo anida el estado de formas distintas segun la version, asi que se busca en profundidad
+ * en lugar de dar por hecha una ruta concreta.
+ */
+export function estadoDeCambio(valor) {
+  const visitar = (nodo, prof) => {
+    if (!nodo || typeof nodo !== 'object' || prof > 5) return null;
+    if (Array.isArray(nodo)) {
+      for (const x of nodo) {
+        const hit = visitar(x, prof + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    const candidato = nodo.lead_status || nodo.status || nodo;
+    if (candidato && candidato.id !== undefined && candidato.pipeline_id !== undefined) {
+      return { status_id: Number(candidato.id), pipeline_id: Number(candidato.pipeline_id) };
+    }
+    for (const k of Object.keys(nodo)) {
+      const hit = visitar(nodo[k], prof + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return visitar(valor, 0);
+}
+
+/**
+ * Diccionario de etapas, indexado por `pipeline_id|status_id`.
+ * Los status 142 (ganado) y 143 (perdido) EXISTEN EN TODOS LOS PIPELINES con el mismo id,
+ * así que indexar solo por status_id haría que todos los ganados y perdidos de la cuenta
+ * se atribuyeran a un único pipeline (el último leído). De ahí la clave compuesta.
+ */
 export async function buildStageIndex() {
   const pipelines = await getPipelines();
   const porStatus = new Map();
+  const porPipeline = new Map();
   for (const p of pipelines) {
+    porPipeline.set(p.pipeline_id, p.pipeline);
     for (const e of p.etapas) {
-      porStatus.set(e.status_id, { pipeline: p.pipeline, pipeline_id: p.pipeline_id, etapa: e.etapa, orden: e.orden, tipo: e.tipo });
+      porStatus.set(`${p.pipeline_id}|${e.status_id}`, {
+        pipeline: p.pipeline, pipeline_id: p.pipeline_id, etapa: e.etapa, orden: e.orden, tipo: e.tipo,
+      });
     }
   }
-  return { pipelines, porStatus };
+  return { pipelines, porStatus, porPipeline };
 }
 
-export function nombreEtapa(porStatus, lead) {
-  const hit = porStatus.get(lead.status_id);
+export function nombreEtapa(index, lead) {
+  const { porStatus, porPipeline } = index;
+  const hit = porStatus.get(`${lead.pipeline_id}|${lead.status_id}`);
   if (hit) return hit;
-  if (lead.status_id === 142) return { pipeline: '(global)', pipeline_id: lead.pipeline_id, etapa: 'Ganado', orden: 9998, tipo: 1 };
-  if (lead.status_id === 143) return { pipeline: '(global)', pipeline_id: lead.pipeline_id, etapa: 'Perdido', orden: 9999, tipo: 2 };
-  return { pipeline: '(desconocido)', pipeline_id: lead.pipeline_id, etapa: `status ${lead.status_id}`, orden: 10000, tipo: 0 };
+  const pipeline = porPipeline.get(lead.pipeline_id) || '(pipeline desconocido)';
+  if (lead.status_id === 142) {
+    return { pipeline, pipeline_id: lead.pipeline_id, etapa: 'Logrado con éxito', orden: 10000, tipo: 1 };
+  }
+  if (lead.status_id === 143) {
+    return { pipeline, pipeline_id: lead.pipeline_id, etapa: 'Ventas Perdidos', orden: 11000, tipo: 2 };
+  }
+  return { pipeline, pipeline_id: lead.pipeline_id, etapa: `status ${lead.status_id}`, orden: 12000, tipo: 0 };
 }
 
 export function diaDe(unix) {
